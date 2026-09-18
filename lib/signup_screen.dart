@@ -2,10 +2,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:image_picker/image_picker.dart'; 
+import 'package:google_sign_in/google_sign_in.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'dart:io';
 import 'login_screen.dart';
+import 'home_screen.dart';
+import 'admin_dashboard_screen.dart';
+import 'driver_dashboard_screen.dart';
 import 'sos_screen.dart';
 
 class CnicInputFormatter extends TextInputFormatter {
@@ -99,6 +103,132 @@ class _SignUpScreenState extends State<SignUpScreen> {
     _parentContactController.dispose();
     _cnicTextController.dispose();
     super.dispose();
+  }
+
+  // --- Route User Based on Firestore Role ---
+  Future<void> _routeUser(String uid) async {
+    DocumentSnapshot driverDoc = await _firestore
+        .collection('women_safety_data')
+        .doc('riders_data')
+        .collection('profiles')
+        .doc(uid)
+        .get();
+
+    if (!mounted) return;
+
+    if (driverDoc.exists) {
+      Navigator.pushAndRemoveUntil(
+        context,
+        MaterialPageRoute(builder: (context) => const DriverDashboardScreen()),
+        (route) => false,
+      );
+      return;
+    }
+
+    DocumentSnapshot userDoc = await _firestore
+        .collection('women_safety_data')
+        .doc('users_data')
+        .collection('profiles')
+        .doc(uid)
+        .get();
+
+    if (!mounted) return;
+
+    String role = '';
+    if (userDoc.exists && userDoc.data() != null) {
+      final data = userDoc.data() as Map<String, dynamic>;
+      role = data['role'] ?? '';
+    }
+
+    if (role.toLowerCase() == 'admin') {
+      Navigator.pushAndRemoveUntil(
+        context,
+        MaterialPageRoute(builder: (context) => const AdminDashboardScreen()),
+        (route) => false,
+      );
+    } else {
+      Navigator.pushAndRemoveUntil(
+        context,
+        MaterialPageRoute(builder: (context) => HomeScreen()),
+        (route) => false,
+      );
+    }
+  }
+
+  // --- Google Sign-In Method ---
+  Future<void> _signUpWithGoogle() async {
+    setState(() => _isLoading = true);
+
+    try {
+      final GoogleSignInAccount? googleUser = await GoogleSignIn().signIn();
+
+      if (googleUser == null) {
+        setState(() => _isLoading = false);
+        return;
+      }
+
+      final GoogleSignInAuthentication googleAuth = await googleUser.authentication;
+
+      final OAuthCredential credential = GoogleAuthProvider.credential(
+        accessToken: googleAuth.accessToken,
+        idToken: googleAuth.idToken,
+      );
+
+      UserCredential userCredential = await _auth.signInWithCredential(credential);
+      User? user = userCredential.user;
+
+      if (user != null) {
+        final String uid = user.uid;
+
+        DocumentSnapshot driverDoc = await _firestore
+            .collection('women_safety_data')
+            .doc('riders_data')
+            .collection('profiles')
+            .doc(uid)
+            .get();
+
+        DocumentSnapshot userDoc = await _firestore
+            .collection('women_safety_data')
+            .doc('users_data')
+            .collection('profiles')
+            .doc(uid)
+            .get();
+
+        if (!driverDoc.exists && !userDoc.exists) {
+          await _firestore
+              .collection('women_safety_data')
+              .doc('users_data')
+              .collection('profiles')
+              .doc(uid)
+              .set({
+            'uid': uid,
+            'name': user.displayName ?? 'Google User',
+            'email': user.email ?? '',
+            'phone': user.phoneNumber ?? '',
+            'city': 'Faisalabad',
+            'role': 'passenger',
+            'cnic_number': '',
+            'cnic': '',
+            'cnic_status': 'pending',
+            'emergency_contacts': {
+              'mother': '',
+              'parent': '',
+            },
+            'photoUrl': user.photoURL ?? '',
+            'createdAt': FieldValue.serverTimestamp(),
+          });
+        }
+
+        if (!mounted) return;
+        await _routeUser(uid);
+      }
+    } on FirebaseAuthException catch (e) {
+      _showErrorDialog(e.message ?? "Google Sign-In Authentication Error", title: "Authentication Error");
+    } catch (e) {
+      _showErrorDialog("Google Sign-In failed: ${e.toString()}", title: "Error");
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
   }
 
   bool _isValidName(String name) {
@@ -434,7 +564,6 @@ class _SignUpScreenState extends State<SignUpScreen> {
             .set(passengerData);
       }
 
-      // SIGN OUT USER AFTER REGISTRATION TO PREVENT DIRECT DASHBOARD LOGIN
       await _auth.signOut();
 
       if (mounted) {
@@ -656,6 +785,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
                   ),
                   const SizedBox(height: 30),
 
+                  // Sign Up Button
                   Container(
                     width: double.infinity, 
                     height: 55,
@@ -671,6 +801,79 @@ class _SignUpScreenState extends State<SignUpScreen> {
                           : const Text("SIGN UP", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                     ),
                   ),
+
+                  const SizedBox(height: 15),
+
+                  // Divider Text
+                  const Row(
+                    children: [
+                      Expanded(child: Divider()),
+                      Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 10),
+                        child: Text("OR", style: TextStyle(color: Colors.grey)),
+                      ),
+                      Expanded(child: Divider()),
+                    ],
+                  ),
+
+                  const SizedBox(height: 15),
+
+                  // Google Sign-In Button
+                  SizedBox(
+                    width: double.infinity,
+                    height: 50,
+                    child: OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        backgroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        side: BorderSide(color: Colors.grey.shade300),
+                      ),
+                      icon: Image.network(
+                        'https://upload.wikimedia.org/wikipedia/commons/5/53/Google_%22G%22_Logo.svg',
+                        height: 22,
+                        width: 22,
+                        errorBuilder: (context, error, stackTrace) =>
+                            const Icon(Icons.g_mobiledata, color: Colors.red, size: 28),
+                      ),
+                      label: const Text(
+                        "Sign up with Google",
+                        style: TextStyle(
+                          color: Colors.black87,
+                          fontSize: 15,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      onPressed: _isLoading ? null : _signUpWithGoogle,
+                    ),
+                  ),
+
+                  const SizedBox(height: 15),
+
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Text("Already have an account? "),
+                      TextButton(
+                        onPressed: () => Navigator.pushAndRemoveUntil(
+                          context,
+                          MaterialPageRoute(
+                            builder: (context) => const LoginScreen(),
+                          ),
+                          (route) => false,
+                        ),
+                        child: const Text(
+                          "Log In",
+                          style: TextStyle(
+                            color: Color(0xFFE91E63),
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+
                   const SizedBox(height: 20),
                 ],
               ),

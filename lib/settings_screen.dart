@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:google_sign_in/google_sign_in.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'login_screen.dart';
@@ -203,23 +204,36 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
 
     try {
+      final String uid = user.uid;
+
+      // 1. Delete Firestore User / Driver Document
       if (role == 'driver') {
         await _firestore
             .collection('women_safety_data')
             .doc('riders_data')
             .collection('profiles')
-            .doc(user.uid)
+            .doc(uid)
             .delete();
       } else {
         await _firestore
             .collection('women_safety_data')
             .doc('users_data')
             .collection('profiles')
-            .doc(user.uid)
+            .doc(uid)
             .delete();
       }
 
+      // 2. Disconnect Google Sign-In session to clear local account tokens
+      final GoogleSignIn googleSignIn = GoogleSignIn();
+      if (await googleSignIn.isSignedIn()) {
+        await googleSignIn.disconnect();
+      }
+
+      // 3. Delete user from Firebase Auth
       await user.delete();
+
+      // 4. Sign out from Firebase Auth completely
+      await _auth.signOut();
 
       if (mounted) {
         Navigator.pop(context);
