@@ -1,7 +1,9 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:geolocator/geolocator.dart';
 import 'login_screen.dart';
 import 'ride_history_screen.dart';
 import 'sos_service.dart';
@@ -21,6 +23,52 @@ class _DriverDashboardScreenState extends State<DriverDashboardScreen> {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
   bool _isOnline = true;
+  StreamSubscription<Position>? _positionStreamSubscription;
+
+  @override
+  void initState() {
+    super.initState();
+    _startLiveLocationUpdates();
+  }
+
+  @override
+  void dispose() {
+    _positionStreamSubscription?.cancel();
+    super.dispose();
+  }
+
+  // Live Location Tracker for drivers
+  void _startLiveLocationUpdates() async {
+    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) return;
+
+    LocationPermission permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied) return;
+    }
+
+    _positionStreamSubscription = Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(
+        accuracy: LocationAccuracy.high,
+        distanceFilter: 15, // Update every 15 meters
+      ),
+    ).listen((Position position) {
+      User? user = _auth.currentUser;
+      if (user != null && _isOnline) {
+        _firestore
+            .collection('women_safety_data')
+            .doc('riders_data')
+            .collection('profiles')
+            .doc(user.uid)
+            .update({
+          'latitude': position.latitude,
+          'longitude': position.longitude,
+          'lastUpdated': FieldValue.serverTimestamp(),
+        });
+      }
+    });
+  }
 
   Future<void> _toggleAvailability(bool value) async {
     setState(() => _isOnline = value);
@@ -165,32 +213,140 @@ class _DriverDashboardScreenState extends State<DriverDashboardScreen> {
     );
   }
 
-  Future<void> _acceptRide(String rideId, String driverName, String driverPhone,
-      String driverVehicleNumber) async {
-    User? user = _auth.currentUser;
-    if (user == null) return;
-
+  Future<void> _acceptRideDirectly(
+    String rideId,
+    double passengerFare,
+    String dName,
+    String dPhone,
+    String dVehicle,
+  ) async {
     try {
+      User? user = _auth.currentUser;
+      if (user == null) return;
+
       await _firestore.collection('rides').doc(rideId).update({
         'status': 'accepted',
         'driverId': user.uid,
-        'driverName': driverName,
-        'driverPhone': driverPhone,
-        'driverVehicleNumber': driverVehicleNumber,
-        'acceptedAt': FieldValue.serverTimestamp(),
+        'driverName': dName,
+        'driverPhone': dPhone,
+        'driverVehicleNumber': dVehicle,
+        'fare': passengerFare,
       });
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-              content: Text("Ride accepted! Head to pickup location."),
-              backgroundColor: Colors.green),
+            content: Text("Ride accepted successfully!"),
+            backgroundColor: Colors.green,
+          ),
         );
       }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Error: $e"), backgroundColor: Colors.red),
+          SnackBar(
+            content: Text("Error accepting ride: $e"),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  // --- InDrive Bidding Modal ---
+  void _showBidModal(
+    String rideId,
+    double passengerFare,
+    String driverName,
+    String driverPhone,
+    String driverVehicleNumber,
+  ) {
+    TextEditingController bidController =
+        TextEditingController(text: passengerFare.toInt().toString());
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("Place Offer / Counter-Bid"),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text("Passenger Offered: Rs. ${passengerFare.toStringAsFixed(0)}"),
+            const SizedBox(height: 12),
+            TextField(
+              controller: bidController,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: "Your Offer (Rs.)",
+                prefixText: "Rs. ",
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text("CANCEL"),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFFE91E63)),
+            onPressed: () async {
+              double bidAmount =
+                  double.tryParse(bidController.text.trim()) ?? passengerFare;
+              Navigator.pop(ctx);
+              await _submitDriverBid(
+                rideId: rideId,
+                proposedFare: bidAmount,
+                driverName: driverName,
+                driverPhone: driverPhone,
+                driverVehicleNumber: driverVehicleNumber,
+              );
+            },
+            child: const Text("SEND OFFER", style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _submitDriverBid({
+    required String rideId,
+    required double proposedFare,
+    required String driverName,
+    required String driverPhone,
+    required String driverVehicleNumber,
+  }) async {
+    User? user = _auth.currentUser;
+    if (user == null) return;
+
+    try {
+      await _firestore.collection('rides').doc(rideId).update({
+        'offers': FieldValue.arrayUnion([
+          {
+            'driverId': user.uid,
+            'driverName': driverName,
+            'driverPhone': driverPhone,
+            'driverVehicleNumber': driverVehicleNumber,
+            'offeredFare': proposedFare,
+            'timestamp': DateTime.now().millisecondsSinceEpoch,
+          }
+        ]),
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("Offer of Rs. $proposedFare sent to passenger!"),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Error submitting bid: $e"), backgroundColor: Colors.red),
         );
       }
     }
@@ -834,6 +990,10 @@ class _DriverDashboardScreenState extends State<DriverDashboardScreen> {
                                     rides[index].data() as Map<String, dynamic>;
                                 String rideId = rides[index].id;
                                 String status = ride['status'] ?? 'pending';
+                                double currentFare =
+                                    (ride['fare'] as num?)?.toDouble() ?? 0.0;
+                                double distance =
+                                    (ride['distance'] as num?)?.toDouble() ?? 0.0;
 
                                 return Card(
                                   elevation: 4,
@@ -856,11 +1016,21 @@ class _DriverDashboardScreenState extends State<DriverDashboardScreen> {
                                                 style: const TextStyle(
                                                     fontWeight: FontWeight.bold,
                                                     fontSize: 16)),
-                                            Text("Rs. ${ride['fare'] ?? '0'}",
-                                                style: const TextStyle(
-                                                    color: Color(0xFFE91E63),
-                                                    fontWeight: FontWeight.bold,
-                                                    fontSize: 18)),
+                                            Column(
+                                              crossAxisAlignment: CrossAxisAlignment.end,
+                                              children: [
+                                                Text("Offer: Rs. $currentFare",
+                                                    style: const TextStyle(
+                                                        color: Color(0xFFE91E63),
+                                                        fontWeight: FontWeight.bold,
+                                                        fontSize: 18)),
+                                                if (distance > 0)
+                                                  Text("Dist: ${distance.toStringAsFixed(2)} km",
+                                                      style: const TextStyle(
+                                                          color: Colors.grey,
+                                                          fontSize: 12)),
+                                              ],
+                                            ),
                                           ],
                                         ),
                                         const Divider(),
@@ -871,11 +1041,29 @@ class _DriverDashboardScreenState extends State<DriverDashboardScreen> {
                                             const SizedBox(width: 10),
                                             Expanded(
                                                 child: Text(
-                                                    "Pickup: ${ride['pickupLocation'] ?? ''}",
+                                                    "Pickup 1: ${ride['pickupLocation'] ?? ''}",
                                                     style: const TextStyle(
                                                         fontSize: 14))),
                                           ],
                                         ),
+                                        if (ride['rideCategory'] == 'Group' && ride['groupPickups'] != null)
+                                          ...((ride['groupPickups'] as List).asMap().entries.map((e) {
+                                            return Padding(
+                                              padding: const EdgeInsets.only(top: 4.0),
+                                              child: Row(
+                                                children: [
+                                                  const Icon(Icons.my_location,
+                                                      color: Colors.blue, size: 20),
+                                                  const SizedBox(width: 10),
+                                                  Expanded(
+                                                      child: Text(
+                                                          "Pickup ${e.key + 2}: ${e.value['pickupLocation'] ?? ''}",
+                                                          style: const TextStyle(
+                                                              fontSize: 14))),
+                                                ],
+                                              ),
+                                            );
+                                          })),
                                         const SizedBox(height: 8),
                                         Row(
                                           children: [
@@ -902,19 +1090,39 @@ class _DriverDashboardScreenState extends State<DriverDashboardScreen> {
                                                     foregroundColor: Colors.red,
                                                     side: const BorderSide(
                                                         color: Colors.red),
-                                                    padding: const EdgeInsets
-                                                        .symmetric(
-                                                        horizontal: 8),
+                                                    padding: EdgeInsets.zero,
                                                   ),
                                                   child: const Text("DECLINE",
+                                                      style: TextStyle(fontSize: 12),
                                                       maxLines: 1),
                                                 ),
                                               ),
-                                              const SizedBox(width: 10),
+                                              const SizedBox(width: 5),
                                               Expanded(
                                                 child: ElevatedButton(
-                                                  onPressed: () => _acceptRide(
+                                                  onPressed: () => _acceptRideDirectly(
                                                       rideId,
+                                                      currentFare,
+                                                      driverName,
+                                                      driverPhone,
+                                                      driverVehicleNumber),
+                                                  style:
+                                                      ElevatedButton.styleFrom(
+                                                    backgroundColor: Colors.green,
+                                                    foregroundColor: Colors.white,
+                                                    padding: EdgeInsets.zero,
+                                                  ),
+                                                  child: const Text("ACCEPT",
+                                                      style: TextStyle(fontSize: 12),
+                                                      maxLines: 1),
+                                                ),
+                                              ),
+                                              const SizedBox(width: 5),
+                                              Expanded(
+                                                child: ElevatedButton(
+                                                  onPressed: () => _showBidModal(
+                                                      rideId,
+                                                      currentFare,
                                                       driverName,
                                                       driverPhone,
                                                       driverVehicleNumber),
@@ -924,11 +1132,10 @@ class _DriverDashboardScreenState extends State<DriverDashboardScreen> {
                                                         const Color(0xFFE91E63),
                                                     foregroundColor:
                                                         Colors.white,
-                                                    padding: const EdgeInsets
-                                                        .symmetric(
-                                                        horizontal: 8),
+                                                    padding: EdgeInsets.zero,
                                                   ),
-                                                  child: const Text("ACCEPT",
+                                                  child: const Text("BID",
+                                                      style: TextStyle(fontSize: 12),
                                                       maxLines: 1),
                                                 ),
                                               ),

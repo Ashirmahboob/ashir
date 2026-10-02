@@ -8,7 +8,7 @@ import 'package:geocoding/geocoding.dart' as geocoding;
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 
-// Import all your screens
+// Import all required screens
 import 'login_screen.dart';
 import 'ride_history_screen.dart';
 import 'payment_screen.dart';
@@ -19,6 +19,7 @@ import 'admin_dashboard_screen.dart';
 import 'settings_screen.dart';
 import 'sos_screen.dart';
 import 'sos_history_screen.dart';
+import 'services/route_distance_service.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -29,10 +30,12 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   static final DateTime bookingCutoffDate =
-      DateTime(2026, 9, 12, 23, 59, 59);
+      DateTime(2026, 10, 15, 23, 59, 59);
 
   final MapController _mapController = MapController();
   final TextEditingController _destinationController = TextEditingController();
+  final TextEditingController _customFareController = TextEditingController();
+  final FocusNode _destinationFocusNode = FocusNode();
 
   LatLng? _currentPosition;
   LatLng? _destinationPosition;
@@ -48,29 +51,102 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _profilePic;
   bool _isAdmin = false;
 
-  // First ride discount tracking
+  double _recommendedFare = 150.0;
+  double _calculatedDistance = 0.0;
   bool _hasUsedFirstRideDiscount = false;
+  double _mainPassengerDistanceKm = 0.0;
+  List<double> _groupPassengerDistancesKm = [];
+  List<double>? _cachedRouteLegDistancesKm;
+  String? _routeCacheKey;
+  String? _routeError;
+  bool _isRouteCalculating = false;
+  int _routeCalculationId = 0;
+  Timer? _peakFareTimer;
 
   final FirebaseAuth _auth = FirebaseAuth.instance;
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+
 
   StreamSubscription<DocumentSnapshot>? _userProfileSubscription;
 
   @override
   void initState() {
     super.initState();
+    _schedulePeakFareRefresh();
+    _destinationFocusNode.addListener(() {
+      if (!_destinationFocusNode.hasFocus && _destinationController.text.trim().isNotEmpty) {
+        _getCoordinatesFromAddress(_destinationController.text.trim());
+      }
+    });
     _getCurrentLocation();
     _listenToUserData();
   }
 
+  final List<TextEditingController> _groupPickupControllers = [];
+  final List<LatLng?> _groupPickupPositions = [];
+
   @override
   void dispose() {
+    _peakFareTimer?.cancel();
+    _destinationFocusNode.dispose();
     _userProfileSubscription?.cancel();
     _destinationController.dispose();
+    _customFareController.dispose();
+    for (var controller in _groupPickupControllers) {
+      controller.dispose();
+    }
     super.dispose();
   }
 
-  // Real-time listener fetching profile & discount state
+  void _addGroupPickup() {
+    if (_groupPickupControllers.length < 3) {
+      setState(() {
+        _groupPickupControllers.add(TextEditingController());
+        _groupPickupPositions.add(null);
+      });
+    }
+  }
+
+  void _removeGroupPickup(int index) {
+    setState(() {
+      _groupPickupControllers[index].dispose();
+      _groupPickupControllers.removeAt(index);
+      _groupPickupPositions.removeAt(index);
+      unawaited(_calculateRecommendedFare());
+    });
+  }
+
+  Future<LatLng?> _getCoordinatesForGroupPickup(String address) async {
+    if (address.isEmpty) return null;
+    try {
+      return await _geocodeAddressInCity(address);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("Could not find location for '$address'"),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+    return null;
+  }
+
+  Future<LatLng?> _geocodeAddressInCity(String address) async {
+    final geocoding.Geocoding geocodingService = geocoding.Geocoding();
+    final String city = _currentCity.trim().isEmpty
+        ? 'Faisalabad'
+        : _currentCity.trim();
+    final locations = await geocodingService.locationFromAddress(
+      '${address.trim()}, $city, Punjab, Pakistan',
+    );
+
+    if (locations.isEmpty) return null;
+    final geocoding.Location location = locations.first;
+    return LatLng(location.latitude, location.longitude);
+  }
+
   void _listenToUserData() {
     User? user = _auth.currentUser;
     if (user == null) return;
@@ -129,6 +205,147 @@ class _HomeScreenState extends State<HomeScreen> {
         });
       }
     });
+  }
+
+  // --- Dynamic Distance & Fare Calculator ---
+  DateTime _nowInPakistan() =>
+      DateTime.now().toUtc().add(const Duration(hours: 5));
+
+  bool get _isPeakFareTime {
+    final DateTime now = _nowInPakistan();
+    return now.hour >= 18 && now.hour < 21;
+  }
+
+  double get _currentFareRatePerKm => _isPeakFareTime ? 150.0 : 100.0;
+
+  void _schedulePeakFareRefresh() {
+    _peakFareTimer?.cancel();
+    final DateTime now = _nowInPakistan();
+    final DateTime nextPeakTransition;
+    if (now.hour < 18) {
+      nextPeakTransition = DateTime.utc(now.year, now.month, now.day, 18);
+    } else if (now.hour < 21) {
+      nextPeakTransition = DateTime.utc(now.year, now.month, now.day, 21);
+    } else {
+      nextPeakTransition = DateTime.utc(now.year, now.month, now.day + 1, 18);
+    }
+
+    _peakFareTimer = Timer(
+      nextPeakTransition.difference(now) + const Duration(milliseconds: 100),
+      () {
+        if (!mounted) return;
+        unawaited(_calculateRecommendedFare());
+        _schedulePeakFareRefresh();
+      },
+    );
+  }
+
+  Future<bool> _calculateRecommendedFare({bool forceRefresh = false}) async {
+    final int calculationId = ++_routeCalculationId;
+    await Future<void>.delayed(Duration.zero);
+    if (!mounted) return false;
+
+    if (_currentPosition == null || _destinationPosition == null) {
+      setState(() {
+        _isRouteCalculating = false;
+        _routeError = null;
+        _calculatedDistance = 0.0;
+        _mainPassengerDistanceKm = 0.0;
+        _groupPassengerDistancesKm = [];
+        _cachedRouteLegDistancesKm = null;
+        _routeCacheKey = null;
+      });
+      return false;
+    }
+
+    final List<LatLng> waypoints = [_currentPosition!];
+    final List<int> pickupWaypointIndices = [];
+    if (_selectedRideType == 'Group') {
+      for (int i = 0; i < _groupPickupControllers.length; i++) {
+        if (_groupPickupControllers[i].text.trim().isEmpty) continue;
+        final LatLng? pickup = _groupPickupPositions[i];
+        if (pickup == null) {
+          setState(() {
+            _isRouteCalculating = false;
+            _routeError = 'Submit each pickup location to calculate its route.';
+            _calculatedDistance = 0.0;
+            _mainPassengerDistanceKm = 0.0;
+            _groupPassengerDistancesKm = [];
+            _cachedRouteLegDistancesKm = null;
+            _routeCacheKey = null;
+          });
+          return false;
+        }
+        pickupWaypointIndices.add(waypoints.length);
+        waypoints.add(pickup);
+      }
+    }
+    waypoints.add(_destinationPosition!);
+
+    final String cacheKey = waypoints
+        .map((point) => '${point.latitude.toStringAsFixed(6)},${point.longitude.toStringAsFixed(6)}')
+        .join('|');
+
+    void applyDistances(List<double> legDistancesKm) {
+      final double totalDistanceKm =
+          legDistancesKm.fold(0.0, (total, distance) => total + distance);
+      final List<double> passengerDistances = pickupWaypointIndices
+          .map((waypointIndex) => legDistancesKm
+              .skip(waypointIndex)
+              .fold(0.0, (total, distance) => total + distance))
+          .toList();
+      double computedFare = totalDistanceKm * _currentFareRatePerKm;
+      if (!_hasUsedFirstRideDiscount) computedFare *= 0.80;
+      double roundedFare = (computedFare / 10).round() * 10.0;
+      if (roundedFare < 50.0) roundedFare = 50.0;
+
+      setState(() {
+        _calculatedDistance = totalDistanceKm;
+        _mainPassengerDistanceKm = totalDistanceKm;
+        _groupPassengerDistancesKm = passengerDistances;
+        _recommendedFare = roundedFare;
+        _customFareController.text = roundedFare.toInt().toString();
+        _isRouteCalculating = false;
+        _routeError = null;
+      });
+    }
+
+    if (!forceRefresh &&
+        cacheKey == _routeCacheKey &&
+        _cachedRouteLegDistancesKm != null) {
+      applyDistances(_cachedRouteLegDistancesKm!);
+      return true;
+    }
+
+    setState(() {
+      _isRouteCalculating = true;
+      _routeError = null;
+    });
+
+    try {
+      final List<double> legDistancesKm =
+          await RouteDistanceService.getLegDistancesKm(waypoints);
+      if (calculationId != _routeCalculationId || !mounted) return false;
+      if (legDistancesKm.length != waypoints.length - 1) {
+        throw const FormatException('Route returned an unexpected number of legs.');
+      }
+      _routeCacheKey = cacheKey;
+      _cachedRouteLegDistancesKm = legDistancesKm;
+      applyDistances(legDistancesKm);
+      return true;
+    } catch (_) {
+      if (calculationId != _routeCalculationId || !mounted) return false;
+      setState(() {
+        _isRouteCalculating = false;
+        _routeError = 'Could not calculate a road route. Check the locations and connection.';
+        _calculatedDistance = 0.0;
+        _mainPassengerDistanceKm = 0.0;
+        _groupPassengerDistancesKm = [];
+        _cachedRouteLegDistancesKm = null;
+        _routeCacheKey = null;
+      });
+      return false;
+    }
   }
 
   Future<void> _handleLogout() async {
@@ -197,8 +414,9 @@ class _HomeScreenState extends State<HomeScreen> {
         String addressStr =
             "${place.street ?? ''}, ${place.subLocality ?? place.locality ?? ''}"
                 .trim();
-        if (addressStr.startsWith(','))
+        if (addressStr.startsWith(',')) {
           addressStr = addressStr.substring(1).trim();
+        }
 
         if (mounted) {
           setState(() {
@@ -210,6 +428,7 @@ class _HomeScreenState extends State<HomeScreen> {
               _destinationController.text = addressStr.isNotEmpty
                   ? addressStr
                   : "${point.latitude.toStringAsFixed(4)}, ${point.longitude.toStringAsFixed(4)}";
+              unawaited(_calculateRecommendedFare());
             }
           });
         }
@@ -220,6 +439,7 @@ class _HomeScreenState extends State<HomeScreen> {
           _destinationPosition = point;
           _destinationController.text =
               "${point.latitude.toStringAsFixed(4)}, ${point.longitude.toStringAsFixed(4)}";
+            unawaited(_calculateRecommendedFare());
         });
       }
     }
@@ -227,6 +447,33 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _onMapTapped(TapPosition tapPosition, LatLng point) {
     _getAddressFromCoordinates(point, isPickup: false);
+  }
+
+  Future<void> _getCoordinatesFromAddress(String address) async {
+    if (address.isEmpty) return;
+    try {
+      final String requestedAddress = address.trim();
+      final LatLng? point = await _geocodeAddressInCity(requestedAddress);
+
+      if (point != null &&
+          mounted &&
+          _destinationController.text.trim() == requestedAddress) {
+        setState(() {
+          _destinationPosition = point;
+          unawaited(_calculateRecommendedFare());
+        });
+        _mapController.move(point, 15.0);
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("Could not find location for '$address'"),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
   }
 
   Future<void> _cancelRideByPassenger(String rideId) async {
@@ -243,7 +490,7 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 12),
             TextField(
               controller: reasonController,
-              decoration: InputDecoration(
+              decoration: const InputDecoration(
                 hintText: "Reason for cancellation (optional)",
                 border: OutlineInputBorder(),
               ),
@@ -296,6 +543,26 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Future<void> _acceptDriverOffer(String rideId, Map<String, dynamic> offer) async {
+    try {
+      await _firestore.collection('rides').doc(rideId).update({
+        'status': 'accepted',
+        'driverId': offer['driverId'],
+        'driverName': offer['driverName'],
+        'driverPhone': offer['driverPhone'],
+        'driverVehicleNumber': offer['driverVehicleNumber'],
+        'fare': offer['offeredFare'],
+        'acceptedAt': FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Error accepting offer: $e"), backgroundColor: Colors.red),
+        );
+      }
+    }
+  }
+
   Future<void> _submitRideRequest() async {
     if (DateTime.now().isAfter(bookingCutoffDate)) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -330,6 +597,26 @@ class _HomeScreenState extends State<HomeScreen> {
 
     setState(() => _isBooking = true);
 
+    if (_currentPosition == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Waiting for your current location... Please ensure GPS is enabled."),
+          backgroundColor: Colors.orange,
+        ),
+      );
+      setState(() => _isBooking = false);
+      return;
+    }
+
+    if (_destinationPosition == null) {
+      LatLng? destPos = await _getCoordinatesForGroupPickup(destination);
+      if (destPos == null) {
+        setState(() => _isBooking = false);
+        return;
+      }
+      _destinationPosition = destPos;
+    }
+
     try {
       QuerySnapshot driverSnapshot = await _firestore
           .collection('women_safety_data')
@@ -358,13 +645,63 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           );
         }
+        setState(() => _isBooking = false);
         return;
       }
 
-      // Calculate Fare: 20% discount if first ride
-      double baseFare = 150.0;
-      bool isDiscountApplied = !_hasUsedFirstRideDiscount;
-      double finalFare = isDiscountApplied ? (baseFare * 0.80) : baseFare;
+      if (_selectedRideType == 'Group') {
+        for (int i = 0; i < _groupPickupControllers.length; i++) {
+          if (_groupPickupControllers[i].text.trim().isEmpty) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text("Please fill all pickup locations or remove empty ones."),
+                backgroundColor: Colors.orange,
+              ),
+            );
+            setState(() => _isBooking = false);
+            return;
+          }
+          if (_groupPickupPositions[i] == null) {
+            LatLng? pos = await _getCoordinatesForGroupPickup(_groupPickupControllers[i].text.trim());
+            if (pos == null) {
+              setState(() => _isBooking = false);
+              return; 
+            }
+            _groupPickupPositions[i] = pos;
+          }
+        }
+      }
+
+      final bool routeCalculated =
+          await _calculateRecommendedFare(forceRefresh: true);
+        if (!mounted) return;
+      if (!routeCalculated) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(_routeError ?? 'Could not calculate the road route.'),
+            backgroundColor: Colors.red,
+          ),
+        );
+        setState(() => _isBooking = false);
+        return;
+      }
+
+      double passengerProposedFare =
+          double.tryParse(_customFareController.text.trim()) ?? _recommendedFare;
+
+      List<Map<String, dynamic>> additionalPickups = [];
+        final double mainUserDistance = _mainPassengerDistanceKm;
+
+      if (_selectedRideType == 'Group') {
+          for (int i = 0; i < _groupPickupControllers.length; i++) {
+              additionalPickups.add({
+                  'pickupLocation': _groupPickupControllers[i].text.trim(),
+                  'pickupLat': _groupPickupPositions[i]?.latitude,
+                  'pickupLng': _groupPickupPositions[i]?.longitude,
+                  'distanceToDropoff': _groupPassengerDistancesKm[i],
+              });
+          }
+      }
 
       DocumentReference rideRef = await _firestore.collection('rides').add({
         'passengerId': user.uid,
@@ -372,14 +709,18 @@ class _HomeScreenState extends State<HomeScreen> {
         'pickupLocation': _currentAddress,
         'pickupLat': _currentPosition?.latitude,
         'pickupLng': _currentPosition?.longitude,
+        'mainPassengerDistance': mainUserDistance,
+        'groupPickups': additionalPickups,
         'dropoffLocation': destination,
         'dropoffLat': _destinationPosition?.latitude,
         'dropoffLng': _destinationPosition?.longitude,
         'rideCategory': _selectedRideType,
         'vehicleType': _selectedVehicleOption,
         'city': _currentCity,
-        'fare': finalFare,
-        'isFirstRideDiscountApplied': isDiscountApplied,
+        'distance': _calculatedDistance,
+        'fare': passengerProposedFare,
+        'offers': [],
+        'isFirstRideDiscountApplied': !_hasUsedFirstRideDiscount,
         'status': 'pending',
         'driverId': null,
         'driverName': null,
@@ -545,7 +886,6 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // Helper method to mark first ride discount as used upon completion
   Future<void> _markFirstRideDiscountUsed(String passengerId) async {
     try {
       await _firestore
@@ -580,30 +920,79 @@ class _HomeScreenState extends State<HomeScreen> {
 
             var ride = snapshot.data!.data() as Map<String, dynamic>;
             String status = ride['status'] ?? 'pending';
+            List offers = ride['offers'] ?? [];
 
             if (status == 'pending') {
               return Container(
-                padding: const EdgeInsets.all(24),
+                padding: const EdgeInsets.all(20),
+                constraints: BoxConstraints(
+                  maxHeight: MediaQuery.of(context).size.height * 0.6,
+                ),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const CircularProgressIndicator(color: Color(0xFFE91E63)),
-                    const SizedBox(height: 20),
-                    const Text("Finding your driver...",
-                        style: TextStyle(
-                            fontSize: 18, fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 8),
+                    const LinearProgressIndicator(color: Color(0xFFE91E63)),
+                    const SizedBox(height: 12),
                     Text(
-                        "Notifying nearby $_selectedVehicleOption drivers in $_currentCity.",
+                      offers.isEmpty
+                          ? "Waiting for Driver Bids..."
+                          : "${offers.length} Driver Offer(s) Received",
+                      style: const TextStyle(
+                          fontSize: 18, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 6),
+                    Text("Offered Fare: Rs. ${ride['fare']}",
                         style: const TextStyle(color: Colors.grey)),
-                    const SizedBox(height: 20),
+                    const SizedBox(height: 12),
+                    if (offers.isNotEmpty)
+                      Expanded(
+                        child: ListView.builder(
+                          itemCount: offers.length,
+                          itemBuilder: (context, idx) {
+                            var offer = Map<String, dynamic>.from(offers[idx]);
+                            return Card(
+                              margin: const EdgeInsets.symmetric(vertical: 6),
+                              child: ListTile(
+                                leading: const CircleAvatar(
+                                  backgroundColor: Color(0xFFE91E63),
+                                  child: Icon(Icons.person, color: Colors.white),
+                                ),
+                                title: Text(offer['driverName'] ?? 'Driver',
+                                    style: const TextStyle(
+                                        fontWeight: FontWeight.bold)),
+                                subtitle: Text(
+                                    "Vehicle: ${offer['driverVehicleNumber'] ?? 'N/A'}"),
+                                trailing: ElevatedButton(
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: Colors.green,
+                                    foregroundColor: Colors.white,
+                                  ),
+                                  onPressed: () =>
+                                      _acceptDriverOffer(rideId, offer),
+                                  child: Text("Rs. ${offer['offeredFare']}"),
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      )
+                    else
+                      const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 30),
+                        child: Text(
+                          "Drivers in your area are evaluating your trip request...",
+                          textAlign: TextAlign.center,
+                          style: TextStyle(color: Colors.grey),
+                        ),
+                      ),
                     ElevatedButton.icon(
                       onPressed: () => _cancelRideByPassenger(rideId),
                       icon: const Icon(Icons.cancel),
                       label: const Text("CANCEL REQUEST"),
                       style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.red,
-                          foregroundColor: Colors.white),
+                          foregroundColor: Colors.white,
+                          minimumSize: const Size(double.infinity, 45)),
                     )
                   ],
                 ),
@@ -735,8 +1124,11 @@ class _HomeScreenState extends State<HomeScreen> {
               String driverUid = ride['driverId'] ?? '';
               String passengerId = ride['passengerId'] ?? '';
               bool isRated = ride.containsKey('rating');
+              bool isGroup = ride['rideCategory'] == 'Group';
+              List groupPickups = ride['groupPickups'] ?? [];
+              double mainDist = (ride['mainPassengerDistance'] as num?)?.toDouble() ?? 0.0;
+              double totalFare = (ride['fare'] as num?)?.toDouble() ?? 0.0;
 
-              // Ensure the first-ride discount flag is set to used in Firestore
               if (ride['isFirstRideDiscountApplied'] == true &&
                   passengerId.isNotEmpty) {
                 _markFirstRideDiscountUsed(passengerId);
@@ -744,30 +1136,56 @@ class _HomeScreenState extends State<HomeScreen> {
 
               return Container(
                 padding: const EdgeInsets.all(24),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Icon(Icons.check_circle,
-                        color: Colors.green, size: 60),
-                    const SizedBox(height: 10),
-                    const Text("Ride Completed!",
-                        style: TextStyle(
-                            fontSize: 20, fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 10),
-                    Text("Total Fare Paid: Rs. ${ride['fare']}",
-                        style: const TextStyle(fontSize: 16)),
-                    if (ride['isFirstRideDiscountApplied'] == true)
-                      const Padding(
-                        padding: EdgeInsets.only(top: 4.0),
-                        child: Text(
-                          "(20% First Ride Discount Applied)",
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.check_circle,
+                          color: Colors.green, size: 60),
+                      const SizedBox(height: 10),
+                      const Text("Ride Completed!",
                           style: TextStyle(
-                              color: Colors.green,
-                              fontWeight: FontWeight.bold,
-                              fontSize: 13),
+                              fontSize: 20, fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 10),
+                      Text("Total Fare Paid: Rs. $totalFare",
+                          style: const TextStyle(fontSize: 16)),
+                      if (ride['isFirstRideDiscountApplied'] == true)
+                        const Padding(
+                          padding: EdgeInsets.only(top: 4.0),
+                          child: Text(
+                            "(20% First Ride Discount Applied)",
+                            style: TextStyle(
+                                color: Colors.green,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 13),
+                          ),
                         ),
-                      ),
-                    const SizedBox(height: 20),
+                      if (isGroup && (mainDist > 0 || groupPickups.isNotEmpty)) ...[
+                        const SizedBox(height: 10),
+                        const Text("Fare Breakdown:", style: TextStyle(fontWeight: FontWeight.bold)),
+                        Builder(
+                          builder: (context) {
+                             double totalD = mainDist;
+                             for(var gp in groupPickups) {
+                               totalD += (gp['distanceToDropoff'] as num?)?.toDouble() ?? 0.0;
+                             }
+                             if (totalD <= 0) totalD = 1;
+                             double mainUserFare = (mainDist / totalD) * totalFare;
+                             
+                             return Column(
+                               children: [
+                                 Text("Pickup 1 (You): Rs. ${mainUserFare.toStringAsFixed(0)}", style: const TextStyle(fontSize: 14)),
+                                 ...groupPickups.asMap().entries.map((e) {
+                                   double gpDist = (e.value['distanceToDropoff'] as num?)?.toDouble() ?? 0.0;
+                                   double gpFare = (gpDist / totalD) * totalFare;
+                                   return Text("Pickup ${e.key + 2}: Rs. ${gpFare.toStringAsFixed(0)}", style: const TextStyle(fontSize: 14));
+                                 }),
+                               ],
+                             );
+                          }
+                        ),
+                      ],
+                      const SizedBox(height: 20),
                     if (!isRated) ...[
                       ElevatedButton.icon(
                         onPressed: () {
@@ -797,7 +1215,8 @@ class _HomeScreenState extends State<HomeScreen> {
                       ),
                       child: const Text("DONE"),
                     )
-                  ],
+                    ],
+                  ),
                 ),
               );
             } else if (status == 'rejected') {
@@ -921,23 +1340,33 @@ class _HomeScreenState extends State<HomeScreen> {
                         var data = doc.data() as Map<String, dynamic>;
                         if (data['latitude'] != null &&
                             data['longitude'] != null) {
-                          markers.add(
-                            Marker(
-                              point:
-                                  LatLng(data['latitude'], data['longitude']),
-                              width: 40,
-                              height: 40,
-                              child: Icon(
-                                _selectedVehicleOption == 'Scooty'
-                                    ? Icons.motorcycle
-                                    : (_selectedVehicleOption == 'Car'
-                                        ? Icons.directions_car
-                                        : Icons.electric_rickshaw),
-                                color: Colors.green,
-                                size: 30,
-                              ),
-                            ),
+                          double dLat = (data['latitude'] as num).toDouble();
+                          double dLng = (data['longitude'] as num).toDouble();
+
+                          // Spatial Filter: Show only drivers within 5.0 km radius
+                          double distMeters = Geolocator.distanceBetween(
+                            _currentPosition!.latitude, _currentPosition!.longitude,
+                            dLat, dLng,
                           );
+
+                          if (distMeters <= 5000) {
+                            markers.add(
+                              Marker(
+                                point: LatLng(dLat, dLng),
+                                width: 40,
+                                height: 40,
+                                child: Icon(
+                                  _selectedVehicleOption == 'Scooty'
+                                      ? Icons.motorcycle
+                                      : (_selectedVehicleOption == 'Car'
+                                          ? Icons.directions_car
+                                          : Icons.electric_rickshaw),
+                                  color: Colors.green,
+                                  size: 30,
+                                ),
+                              ),
+                            );
+                          }
                         }
                       }
                     }
@@ -981,7 +1410,7 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
           Positioned(
             right: 16,
-            bottom: MediaQuery.of(context).size.height * 0.54,
+            bottom: MediaQuery.of(context).size.height * 0.58,
             child: FloatingActionButton(
               heroTag: "recenter_btn",
               mini: true,
@@ -1036,6 +1465,7 @@ class _HomeScreenState extends State<HomeScreen> {
               _selectedVehicleOption == 'Scooty') {
             _selectedVehicleOption = 'Rickshaw';
           }
+          unawaited(_calculateRecommendedFare());
         });
       },
       child: Container(
@@ -1325,11 +1755,11 @@ class _HomeScreenState extends State<HomeScreen> {
     final ThemeData theme = Theme.of(context);
 
     return Container(
-      height: MediaQuery.of(context).size.height * 0.52,
+      height: MediaQuery.of(context).size.height * 0.56,
       decoration: BoxDecoration(
         color: theme.colorScheme.surface,
-        borderRadius: BorderRadius.vertical(top: Radius.circular(25)),
-        boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 10)],
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(25)),
+        boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 10)],
       ),
       child: SingleChildScrollView(
         padding: const EdgeInsets.all(20),
@@ -1345,7 +1775,6 @@ class _HomeScreenState extends State<HomeScreen> {
                         borderRadius: BorderRadius.circular(10)))),
             const SizedBox(height: 15),
 
-            // DYNAMIC DISCOUNT BANNER: Hidden once the first ride discount is used
             if (!_hasUsedFirstRideDiscount) ...[
               Container(
                 width: double.infinity,
@@ -1378,15 +1807,88 @@ class _HomeScreenState extends State<HomeScreen> {
 
             TextField(
               controller: _destinationController,
-              decoration: InputDecoration(
+              focusNode: _destinationFocusNode,
+              onChanged: (_) {
+                _destinationPosition = null;
+                unawaited(_calculateRecommendedFare());
+              },
+              onSubmitted: (value) {
+                _getCoordinatesFromAddress(value);
+              },
+              decoration: const InputDecoration(
                 hintText: "Where to? (Tap map or enter place)",
                 prefixIcon: Icon(Icons.search, color: Color(0xFFE91E63)),
                 filled: true,
-                fillColor: theme.colorScheme.surfaceContainerHighest,
                 border: OutlineInputBorder(
                     borderRadius: BorderRadius.all(Radius.circular(30)),
                     borderSide: BorderSide.none),
               ),
+            ),
+            const SizedBox(height: 12),
+
+            if (_selectedRideType == 'Group') ...[
+              for (int i = 0; i < _groupPickupControllers.length; i++)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: TextField(
+                    controller: _groupPickupControllers[i],
+                    onChanged: (_) {
+                      _groupPickupPositions[i] = null;
+                      unawaited(_calculateRecommendedFare());
+                    },
+                    onSubmitted: (value) async {
+                      final String requestedAddress = value.trim();
+                      LatLng? pos = await _getCoordinatesForGroupPickup(requestedAddress);
+                      if (pos != null &&
+                        _groupPickupControllers[i].text.trim() == requestedAddress) {
+                            setState(() {
+                                _groupPickupPositions[i] = pos;
+                                unawaited(_calculateRecommendedFare());
+                            });
+                        }
+                    },
+                    decoration: InputDecoration(
+                      hintText: "Enter Pickup ${i + 2}",
+                      prefixIcon: const Icon(Icons.location_on, color: Colors.blue),
+                      suffixIcon: IconButton(
+                        icon: const Icon(Icons.close, color: Colors.red),
+                        onPressed: () => _removeGroupPickup(i),
+                      ),
+                      filled: true,
+                      border: const OutlineInputBorder(
+                          borderRadius: BorderRadius.all(Radius.circular(30)),
+                          borderSide: BorderSide.none),
+                    ),
+                  ),
+                ),
+              if (_groupPickupControllers.length < 3)
+                TextButton.icon(
+                  onPressed: _addGroupPickup,
+                  icon: const Icon(Icons.add),
+                  label: const Text("Add Another Passenger"),
+                ),
+              const SizedBox(height: 12),
+            ],
+
+            // InDrive Fare Offer Field
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _customFareController,
+                    keyboardType: TextInputType.number,
+                    decoration: InputDecoration(
+                      labelText: "Your Offer Fare (Rs.)",
+                      prefixText: "Rs. ",
+                        helperText: _isRouteCalculating
+                            ? 'Calculating road distance...'
+                            : _routeError ??
+                                'Rec: Rs. ${_recommendedFare.toStringAsFixed(0)} | Distance: ${_calculatedDistance.toStringAsFixed(2)} km | Rate: Rs. ${_currentFareRatePerKm.toStringAsFixed(0)}/km',
+                      border: const OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+              ],
             ),
             const SizedBox(height: 15),
 
@@ -1425,11 +1927,9 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
               child: _isBooking
                   ? const CircularProgressIndicator(color: Colors.white)
-                  : Text(
-                      _hasUsedFirstRideDiscount
-                          ? "FIND RIDE"
-                          : "FIND RIDE (20% OFF APPLIED)",
-                      style: const TextStyle(
+                  : const Text(
+                      "OFFER FARE & FIND RIDE",
+                      style: TextStyle(
                           color: Colors.white, fontWeight: FontWeight.bold),
                     ),
             ),
@@ -1447,7 +1947,12 @@ class _HomeScreenState extends State<HomeScreen> {
     return GestureDetector(
       onTap: isDisabled
           ? null
-          : () => setState(() => _selectedVehicleOption = label),
+          : () {
+              setState(() {
+                _selectedVehicleOption = label;
+                unawaited(_calculateRecommendedFare());
+              });
+            },
       child: Opacity(
         opacity: isDisabled ? 0.35 : 1.0,
         child: Column(
