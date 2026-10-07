@@ -323,7 +323,20 @@ class RideHistoryScreen extends StatelessWidget {
                 // Filter rides where user is passenger OR driver
                 var docs = snapshot.data!.docs.where((doc) {
                   var data = doc.data() as Map<String, dynamic>;
-                  return data['passengerId'] == user.uid || data['driverId'] == user.uid;
+                  final dynamic participants = data['groupParticipants'];
+                  final bool isGroupPassenger = participants is List &&
+                      participants.any((participant) =>
+                          participant is Map &&
+                          participant['passengerId'] == user.uid);
+                    final bool isLegacyGroupOwner =
+                      data['rideCategory'] == 'Group' &&
+                      (participants is! List || participants.isEmpty) &&
+                      data['passengerId'] == user.uid;
+                    return (data['rideCategory'] != 'Group' &&
+                        data['passengerId'] == user.uid) ||
+                      isLegacyGroupOwner ||
+                      isGroupPassenger ||
+                      data['driverId'] == user.uid;
                 }).toList();
 
                 if (docs.isEmpty) {

@@ -446,26 +446,6 @@ class _DriverDashboardScreenState extends State<DriverDashboardScreen> {
     if (driver == null) return;
 
     try {
-      DocumentSnapshot rideDoc =
-          await _firestore.collection('rides').doc(rideId).get();
-      if (!rideDoc.exists) {
-        throw Exception("Ride document does not exist.");
-      }
-
-      var rideData = rideDoc.data() as Map<String, dynamic>;
-      String? passengerId = rideData['passengerId'];
-      double fare = (rideData['fare'] as num?)?.toDouble() ?? 0.0;
-
-      if (passengerId == null || passengerId.isEmpty) {
-        throw Exception("Invalid passenger ID for this ride.");
-      }
-
-      DocumentReference passengerRef = _firestore
-          .collection('women_safety_data')
-          .doc('users_data')
-          .collection('profiles')
-          .doc(passengerId);
-
       DocumentReference driverRef = _firestore
           .collection('women_safety_data')
           .doc('riders_data')
@@ -473,37 +453,98 @@ class _DriverDashboardScreenState extends State<DriverDashboardScreen> {
           .doc(driver.uid);
 
       DocumentReference rideRef = _firestore.collection('rides').doc(rideId);
+      double totalFare = 0.0;
 
       await _firestore.runTransaction((transaction) async {
-        DocumentSnapshot passengerSnapshot =
-            await transaction.get(passengerRef);
-
-        double passengerBalance = 0.0;
-        if (passengerSnapshot.exists && passengerSnapshot.data() != null) {
-          var pData = passengerSnapshot.data() as Map<String, dynamic>;
-          passengerBalance =
-              (pData['walletBalance'] as num?)?.toDouble() ?? 0.0;
+        final DocumentSnapshot rideSnapshot = await transaction.get(rideRef);
+        final Map<String, dynamic>? rideData =
+            rideSnapshot.data() as Map<String, dynamic>?;
+        if (rideData == null || rideData['status'] != 'accepted') {
+          throw Exception("This ride is not ready to be completed.");
         }
 
-        if (passengerBalance < fare) {
-          throw Exception(
-              "Passenger has insufficient wallet balance (Rs. ${passengerBalance.toStringAsFixed(2)}).");
+        totalFare = (rideData['fare'] as num?)?.toDouble() ?? 0.0;
+        List<Map<String, dynamic>> participants = [];
+        final dynamic storedParticipants = rideData['groupParticipants'];
+        if (rideData['rideCategory'] == 'Group' &&
+            storedParticipants is List &&
+            storedParticipants.isNotEmpty) {
+          participants = storedParticipants
+              .whereType<Map>()
+              .map((participant) => Map<String, dynamic>.from(participant))
+              .toList();
+        }
+        if (participants.isEmpty) {
+          final String? passengerId = rideData['passengerId'] as String?;
+          if (passengerId == null || passengerId.isEmpty) {
+            throw Exception("Invalid passenger ID for this ride.");
+          }
+          participants = [
+            {
+              'passengerId': passengerId,
+              'passengerName': rideData['passengerName'] ?? 'Passenger',
+            },
+          ];
         }
 
-        transaction.set(
-            passengerRef,
-            {'walletBalance': FieldValue.increment(-fare)},
-            SetOptions(merge: true));
+        final double passengerShare = totalFare / participants.length;
+        final List<DocumentReference> passengerRefs = participants.map(
+          (participant) {
+            final String passengerId =
+                participant['passengerId']?.toString() ?? '';
+            if (passengerId.isEmpty) {
+              throw Exception("Invalid passenger in this group ride.");
+            }
+            return _firestore
+                .collection('women_safety_data')
+                .doc('users_data')
+                .collection('profiles')
+                .doc(passengerId);
+          },
+        ).toList();
+
+        final List<DocumentSnapshot> passengerSnapshots = [];
+        for (final passengerRef in passengerRefs) {
+          passengerSnapshots.add(await transaction.get(passengerRef));
+        }
+        await transaction.get(driverRef);
+
+        for (int index = 0; index < participants.length; index++) {
+          final DocumentSnapshot passengerSnapshot =
+              passengerSnapshots[index];
+          final Map<String, dynamic>? passengerData =
+              passengerSnapshot.data() as Map<String, dynamic>?;
+          final double balance =
+              (passengerData?['walletBalance'] as num?)?.toDouble() ?? 0.0;
+          if (balance < passengerShare) {
+            throw Exception(
+                "${participants[index]['passengerName'] ?? 'A passenger'} has insufficient wallet balance for their Rs. ${passengerShare.toStringAsFixed(2)} share.");
+          }
+        }
+
+        for (final passengerRef in passengerRefs) {
+          transaction.set(
+              passengerRef,
+              {'walletBalance': FieldValue.increment(-passengerShare)},
+              SetOptions(merge: true));
+        }
 
         transaction.set(
             driverRef,
-            {'walletBalance': FieldValue.increment(fare)},
+            {'walletBalance': FieldValue.increment(totalFare)},
             SetOptions(merge: true));
 
         transaction.update(rideRef, {
           'status': 'completed',
           'completedAt': FieldValue.serverTimestamp(),
-          'paidAmount': fare,
+          'paidAmount': totalFare,
+          'participantPayments': participants
+              .map((participant) => {
+                    'passengerId': participant['passengerId'],
+                    'passengerName': participant['passengerName'],
+                    'amount': passengerShare,
+                  })
+              .toList(),
         });
       });
 
@@ -511,7 +552,7 @@ class _DriverDashboardScreenState extends State<DriverDashboardScreen> {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-                "Ride completed! Rs. ${fare.toStringAsFixed(2)} transferred to your wallet."),
+              "Ride completed! Rs. ${totalFare.toStringAsFixed(2)} transferred to your wallet."),
             backgroundColor: Colors.green,
           ),
         );
@@ -994,6 +1035,21 @@ class _DriverDashboardScreenState extends State<DriverDashboardScreen> {
                                     (ride['fare'] as num?)?.toDouble() ?? 0.0;
                                 double distance =
                                     (ride['distance'] as num?)?.toDouble() ?? 0.0;
+                                final bool isGroup =
+                                  ride['rideCategory'] == 'Group';
+                                final List<Map<String, dynamic>> groupParticipants =
+                                  isGroup && ride['groupParticipants'] is List
+                                    ? (ride['groupParticipants'] as List)
+                                      .whereType<Map>()
+                                      .map((participant) =>
+                                        Map<String, dynamic>.from(
+                                          participant))
+                                      .toList()
+                                    : [];
+                                final int groupSize =
+                                  groupParticipants.isEmpty
+                                    ? 1
+                                    : groupParticipants.length;
 
                                 return Card(
                                   elevation: 4,
@@ -1024,6 +1080,12 @@ class _DriverDashboardScreenState extends State<DriverDashboardScreen> {
                                                         color: Color(0xFFE91E63),
                                                         fontWeight: FontWeight.bold,
                                                         fontSize: 18)),
+                                                if (isGroup)
+                                                  Text(
+                                                      "Rs. ${(currentFare / groupSize).toStringAsFixed(2)} each • $groupSize riders",
+                                                    style: const TextStyle(
+                                                      color: Colors.grey,
+                                                      fontSize: 12)),
                                                 if (distance > 0)
                                                   Text("Dist: ${distance.toStringAsFixed(2)} km",
                                                       style: const TextStyle(
@@ -1034,7 +1096,8 @@ class _DriverDashboardScreenState extends State<DriverDashboardScreen> {
                                           ],
                                         ),
                                         const Divider(),
-                                        Row(
+                                        if (!isGroup)
+                                          Row(
                                           children: [
                                             const Icon(Icons.my_location,
                                                 color: Colors.green, size: 20),
@@ -1046,8 +1109,8 @@ class _DriverDashboardScreenState extends State<DriverDashboardScreen> {
                                                         fontSize: 14))),
                                           ],
                                         ),
-                                        if (ride['rideCategory'] == 'Group' && ride['groupPickups'] != null)
-                                          ...((ride['groupPickups'] as List).asMap().entries.map((e) {
+                                        if (isGroup && groupParticipants.isNotEmpty)
+                                          ...groupParticipants.asMap().entries.map((entry) {
                                             return Padding(
                                               padding: const EdgeInsets.only(top: 4.0),
                                               child: Row(
@@ -1057,13 +1120,26 @@ class _DriverDashboardScreenState extends State<DriverDashboardScreen> {
                                                   const SizedBox(width: 10),
                                                   Expanded(
                                                       child: Text(
-                                                          "Pickup ${e.key + 2}: ${e.value['pickupLocation'] ?? ''}",
+                                                          "${entry.value['passengerName'] ?? 'Passenger'}: ${entry.value['pickupLocation'] ?? ''}",
                                                           style: const TextStyle(
                                                               fontSize: 14))),
                                                 ],
                                               ),
                                             );
-                                          })),
+                                          }),
+                                        if (isGroup && groupParticipants.isEmpty)
+                                          Row(
+                                            children: [
+                                              const Icon(Icons.my_location,
+                                                  color: Colors.green, size: 20),
+                                              const SizedBox(width: 10),
+                                              Expanded(
+                                                  child: Text(
+                                                      "Pickup: ${ride['pickupLocation'] ?? ''}",
+                                                      style: const TextStyle(
+                                                          fontSize: 14))),
+                                            ],
+                                          ),
                                         const SizedBox(height: 8),
                                         Row(
                                           children: [
